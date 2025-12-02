@@ -1,0 +1,6 @@
+numpy>=1.24
+torch>=2.0       
+scikit-learn>=1.2
+matplotlib>=3.6
+docker>=6.0.0
+requests>=2.28
