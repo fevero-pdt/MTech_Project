@@ -2,12 +2,8 @@
 """
 scheduler/cassia_demo.py
 
-Updated CASSIA scheduler that:
-- Uses Docker-backed function containers (login/upload/analytics/batch)
-- Instruments startup vs invocation time
-- Resets warm pool before each strategy to ensure fair comparison
-- Prints per-node stats (requests, containers, avg lat, avg startup, avg invoke)
-- Performs brief REINFORCE fine-tuning (small epochs for demo)
+Final version: warm-pool keyed by (func_type, user_id) so warm containers are more granular.
+Everything else similar to the previous instrumented script (startup/invoke timing, reset per strategy).
 """
 
 import os
@@ -42,7 +38,9 @@ FUNCTION_IMAGES = ["cassia-login", "cassia-upload", "cassia-analytics", "cassia-
 FUNCTION_PORT = 8000
 DOCKER_NETWORK = "cassia-net"
 
-WARM_POOL_LIMIT = 20
+# Note: keying by (func_type, user_id) increases number of warm containers.
+# Keep this small if host resources are limited.
+WARM_POOL_LIMIT = 40
 TRAIN_SAMPLES = 600
 TEST_SAMPLES = 200
 REINFORCE_EPOCHS = 2
@@ -51,7 +49,8 @@ LOAD_PENALTY = 0.10
 
 client = docker.from_env()
 
-# warm_pool: per-node OrderedDict to implement LRU eviction easily
+# warm_pool: per-node OrderedDict mapping key -> container record
+# key is (func_type, user_id)
 warm_pool = [OrderedDict() for _ in range(NUM_NODES)]
 
 # -------------------- WORKLOAD & INVOCATIONS --------------------
@@ -177,7 +176,7 @@ class PolicyHead(nn.Module):
 
 scheduler = PolicyHead(model).to(device)
 
-# -------------------- DOCKER UTILS & INVOCATION (instrumented) --------------------
+# -------------------- DOCKER UTILS & INVOCATION (keyed by func+user) --------------------
 def safe_container_remove(container):
     try:
         container.stop(timeout=1)
@@ -201,21 +200,30 @@ def wait_for_http(container_name, port=FUNCTION_PORT, timeout=6.0, interval=0.25
         time.sleep(interval)
     return False
 
-def ensure_container_for_function(node, func_type_idx):
+def ensure_container_for_function(node, func_type_idx, user_id=None):
+    """
+    Ensure a warm container keyed by (func_type, user_id).
+    Returns: (container_name, cold_flag, startup_time_ms)
+    """
     pool = warm_pool[node]
-    key = int(func_type_idx)
+    if user_id is None:
+        key = (int(func_type_idx), -1)
+    else:
+        key = (int(func_type_idx), int(user_id))
+
     if key in pool:
         pool.move_to_end(key)
-        return pool[key]["name"], 0, 0.0  # name, cold_flag, startup_time_ms=0
+        return pool[key]["name"], 0, 0.0
+
     safe_suffix = uuid4().hex[:6]
-    container_name = f"node{node}-f{func_type_idx}-{safe_suffix}"
+    container_name = f"node{node}-f{func_type_idx}-u{key[1]}-{safe_suffix}"
     image = FUNCTION_IMAGES[func_type_idx]
     try:
         container = client.containers.run(image, name=container_name, detach=True, network=DOCKER_NETWORK)
     except docker.errors.APIError:
-        # fallback: random name
         container = client.containers.run(image, detach=True, network=DOCKER_NETWORK)
         container_name = container.name
+
     t0 = time.monotonic()
     ready = wait_for_http(container_name, port=FUNCTION_PORT, timeout=6.0)
     t1 = time.monotonic()
@@ -229,25 +237,20 @@ def ensure_container_for_function(node, func_type_idx):
             safe_container_remove(old_val["container"])
         except Exception:
             pass
-    # log creation
-    print(f"[COLD START] node={node} func={func_type_idx} container={container_name} startup_ms={startup_time_ms:.1f}")
+    print(f"[COLD START] node={node} func={func_type_idx} user={key[1]} container={container_name} startup_ms={startup_time_ms:.1f}")
     return container_name, 1, startup_time_ms
 
-def invoke_function_docker(node, func_type_idx, extra_load=0.0):
+def invoke_function_docker(node, func_type_idx, extra_load=0.0, user_id=None):
     """
     Returns: total_latency_ms, startup_time_ms, invoke_time_ms, cold_flag
     """
-    t_before = time.monotonic()
-    container_name, cold_flag, startup_ms = ensure_container_for_function(node, func_type_idx)
-    t_after_ensure = time.monotonic()
-    # If warm, startup_ms should be 0 (ensured above)
+    container_name, cold_flag, startup_ms = ensure_container_for_function(node, func_type_idx, user_id=user_id)
     url = f"http://{container_name}:{FUNCTION_PORT}/invoke"
     t0 = time.monotonic()
     try:
         r = requests.post(url, timeout=15)
         r.raise_for_status()
     except Exception as e:
-        # try to cleanup container and give big penalty
         print(f"[ERROR] invocation failed for {container_name}: {e}")
         try:
             cont = client.containers.get(container_name)
@@ -258,9 +261,7 @@ def invoke_function_docker(node, func_type_idx, extra_load=0.0):
     else:
         t1 = time.monotonic()
         invoke_ms = (t1 - t0) * 1000.0
-    # total latency = startup + invoke + extra load penalty (we keep startup separate)
     total_latency = startup_ms + invoke_ms + extra_load * LOAD_PENALTY
-    # do NOT add extra +100 if startup_ms already covers cold start; previously you used a static +100 — now we measure startup explicitly
     reward = -total_latency
     return total_latency, startup_ms, invoke_ms, cold_flag
 
@@ -283,7 +284,6 @@ def cleanup_all_warm_containers():
 
 # -------------------- EVALUATION & BASELINES --------------------
 def run_cassia_inference_on_test(scheduler_model, X_test_local, workload_pattern):
-    # instrumentation arrays
     response_times = [[] for _ in range(NUM_NODES)]
     startup_times = [[] for _ in range(NUM_NODES)]
     invoke_times = [[] for _ in range(NUM_NODES)]
@@ -297,14 +297,13 @@ def run_cassia_inference_on_test(scheduler_model, X_test_local, workload_pattern
             x = torch.tensor(x_np, dtype=torch.float32).to(device)
             func_type = int(np.argmax(x_np[:4]))
             user_id = int(scaler.inverse_transform([x_np[4:]])[0][0])
-            func_id = (func_type, user_id)
 
             scores = scheduler_model(x)
             probs = F.softmax(scores.cpu(), dim=-1).squeeze()
             node = int(torch.multinomial(probs, num_samples=1).item())
 
             extra_load = workload_pattern[i][node] if i < len(workload_pattern) else 0
-            total_latency, startup_ms, invoke_ms, cold = invoke_function_docker(node, func_type, extra_load=extra_load)
+            total_latency, startup_ms, invoke_ms, cold = invoke_function_docker(node, func_type, extra_load=extra_load, user_id=user_id)
             if cold:
                 cold_start_events[node] += 1
             response_times[node].append(total_latency)
@@ -312,7 +311,6 @@ def run_cassia_inference_on_test(scheduler_model, X_test_local, workload_pattern
             invoke_times[node].append(invoke_ms)
             total_requests[node] += 1
 
-            # throttle to avoid overloading host
             time.sleep(0.005)
 
     return response_times, startup_times, invoke_times, cold_start_events, total_requests
@@ -386,7 +384,6 @@ def train_reinforce_real(model, X_data, epochs=REINFORCE_EPOCHS):
             x = torch.tensor(x_np, dtype=torch.float32).to(device)
             func_type = int(np.argmax(x_np[:4]))
             user_id = int(scaler.inverse_transform([x_np[4:]])[0][0])
-            func_id = (func_type, user_id)
 
             probs = model(x)
             dist = torch.distributions.Categorical(probs)
@@ -397,8 +394,7 @@ def train_reinforce_real(model, X_data, epochs=REINFORCE_EPOCHS):
             node_counts[node] += 1
 
             extra_load = workload_train[i][node] if i < len(workload_train) else 0
-            total_latency, startup_ms, invoke_ms, cold = invoke_function_docker(node, func_type, extra_load=extra_load)
-            # reward is negative latency; amplify lightly
+            total_latency, startup_ms, invoke_ms, cold = invoke_function_docker(node, func_type, extra_load=extra_load, user_id=user_id)
             reward = -total_latency * 1.0
 
             log_probs.append(log_prob)
@@ -446,24 +442,20 @@ def print_node_stats(prefix, response_times, startup_times, invoke_times, cold_e
         print(f"Node {i}: reqs={total_requests[i]}, containers_kept={containers_kept}, avg_total_lat={avg_lat:.2f} ms, avg_startup={avg_start:.2f} ms, avg_invoke={avg_invoke:.2f} ms, cold_starts={cold_events[i]}")
 
 def main():
-    global scaler  # required in several places
+    global scaler
     try:
-        # Evaluate FIFO baseline
         reset_warm_pool()
         fifo_latency, fifo_cold, fifo_avg, fifo_total, fifo_throughput, fifo_reqs = run_baseline("fifo", workload_pattern=workload_test)
-        # For baselines we have simulated latencies but no startup/invocation separation
         fake_startup_times = [[] for _ in range(NUM_NODES)]
-        fake_invoke_times = fifo_latency  # approximate for printing
+        fake_invoke_times = fifo_latency
         print("\nFIFO baseline (simulated):")
         print_node_stats("FIFO (sim)", fifo_latency, fake_startup_times, fake_invoke_times, fifo_cold, fifo_reqs)
 
-        # Evaluate Round Robin
         reset_warm_pool()
         rr_latency, rr_cold, rr_avg, rr_total, rr_throughput, rr_reqs = run_baseline("round_robin", workload_pattern=workload_test)
         print("\nRound Robin baseline (simulated):")
         print_node_stats("RR (sim)", rr_latency, fake_startup_times, rr_latency, rr_cold, rr_reqs)
 
-        # CASSIA (initial policy)
         reset_warm_pool()
         print("\nRunning CASSIA (initial policy) on real containers...")
         cassia_resp, cassia_start, cassia_invoke, cassia_cold, cassia_reqs = run_cassia_inference_on_test(scheduler, X_test, workload_test)
@@ -472,18 +464,15 @@ def main():
         print_node_stats("CASSIA (initial)", cassia_resp, cassia_start, cassia_invoke, cassia_cold, cassia_reqs)
         print(f"CASSIA initial overall avg latency: {cassia_avg:.2f} ms, total cold starts: {sum(cassia_cold)}")
 
-        # Save initial plots
         os.makedirs("outputs", exist_ok=True)
         save_bar_plot(['FIFO', 'RoundRobin', 'CASSIA'], [fifo_avg, rr_avg, cassia_avg],
                       "Average Latency per Strategy (initial)", "Latency (ms)", "outputs/avg_latency_initial.png")
         save_bar_plot(['FIFO', 'RoundRobin', 'CASSIA'], [sum(fifo_cold), sum(rr_cold), sum(cassia_cold)],
                       "Total Cold Starts per Strategy (initial)", "Cold Starts", "outputs/cold_starts_initial.png")
 
-        # Fine-tune with REINFORCE
         print("\nStarting REINFORCE fine-tuning (on real containers)...")
         train_reinforce_real(reinforce_model, X_train)
 
-        # Evaluate REINFORCE policy
         reset_warm_pool()
         print("\nEvaluating REINFORCE policy on test set (real containers)...")
         reinforce_resp, reinforce_start, reinforce_invoke, reinforce_cold, reinforce_reqs = run_cassia_inference_on_test(reinforce_model, X_test, workload_test)
@@ -492,7 +481,6 @@ def main():
         print_node_stats("REINFORCE", reinforce_resp, reinforce_start, reinforce_invoke, reinforce_cold, reinforce_reqs)
         print(f"REINFORCE overall avg latency: {reinforce_avg:.2f} ms, total cold starts: {sum(reinforce_cold)}")
 
-        # Save final plots
         labels = ['FIFO', 'RoundRobin', 'CASSIA (initial)', 'REINFORCE']
         avg_latencies = [fifo_avg, rr_avg, cassia_avg, reinforce_avg]
         total_cold_starts = [sum(fifo_cold), sum(rr_cold), sum(cassia_cold), sum(reinforce_cold)]
