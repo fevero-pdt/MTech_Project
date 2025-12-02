@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-cassia_scheduler.py
+scheduler/cassia_demo.py
 
-Real Docker-backed scheduler for CASSIA:
-- Starts function containers on cold starts
-- Reuses warm containers per node
-- Measures real latency via HTTP /invoke
-- Runs light SSL pretrain, policy head, and REINFORCE fine-tuning
-
-Prerequisites (run on host with Docker or run scheduler as container with --network cassia-net):
-- Docker images built: cassia-login, cassia-upload, cassia-analytics, cassia-batch
-- Docker network created: docker network create cassia-net
-- Python packages: install via requirements.txt (numpy, torch, scikit-learn, matplotlib, docker, requests)
+Updated CASSIA scheduler that:
+- Uses Docker-backed function containers (login/upload/analytics/batch)
+- Instruments startup vs invocation time
+- Resets warm pool before each strategy to ensure fair comparison
+- Prints per-node stats (requests, containers, avg lat, avg startup, avg invoke)
+- Performs brief REINFORCE fine-tuning (small epochs for demo)
 """
 
 import os
 import time
 import random
-import math
 from uuid import uuid4
 from collections import OrderedDict
 
@@ -47,23 +42,19 @@ FUNCTION_IMAGES = ["cassia-login", "cassia-upload", "cassia-analytics", "cassia-
 FUNCTION_PORT = 8000
 DOCKER_NETWORK = "cassia-net"
 
-WARM_POOL_LIMIT = 20  # per node
-TRAIN_SAMPLES = 1000  # reduce for real container runs
-TEST_SAMPLES  = 400
-REINFORCE_EPOCHS = 3  # keep small initially (real containers are slow)
+WARM_POOL_LIMIT = 20
+TRAIN_SAMPLES = 600
+TEST_SAMPLES = 200
+REINFORCE_EPOCHS = 2
 BATCH_SIZE = 64
+LOAD_PENALTY = 0.10
 
-LOAD_PENALTY = 0.10  # optional additional synthetic load factor
-
-# Docker client
 client = docker.from_env()
 
-# warm_pool: list of dicts per node
-# keying strategy: use (func_type, user_id) or just func_type to reduce #containers.
-# Here we key by func_type to keep warm pool manageable for demo.
+# warm_pool: per-node OrderedDict to implement LRU eviction easily
 warm_pool = [OrderedDict() for _ in range(NUM_NODES)]
 
-# -------------------- HELPERS: Workload & Invocations --------------------
+# -------------------- WORKLOAD & INVOCATIONS --------------------
 
 def generate_bursty_workload(num_nodes, steps, base_rate=30, burst_prob=0.25, skew_strength=0.7):
     workload = []
@@ -71,7 +62,7 @@ def generate_bursty_workload(num_nodes, steps, base_rate=30, burst_prob=0.25, sk
     for t in range(steps):
         if random.random() < 0.4:
             node_loads = [0] * num_nodes
-            for _ in range(num_nodes * base_rate):
+            for _ in range(max(1, num_nodes * base_rate)):
                 node_choice = np.random.choice(range(num_nodes), p=skewed_probs)
                 node_loads[node_choice] += 1
         else:
@@ -104,9 +95,8 @@ def generate_function_invocations(n=10000):
         data.append([function_type, user_id, arrival_time, payload, cpu, memory, cold_start])
     return data
 
-# -------------------- STEP 1: Generate / Preprocess Data --------------------
-
-print("Preparing synthetic invocation dataset (smaller for Docker runs)...")
+# -------------------- DATA PREP --------------------
+print("Preparing data...")
 raw_data = generate_function_invocations(n=TRAIN_SAMPLES + TEST_SAMPLES)
 encoder = OneHotEncoder(sparse_output=False)
 types_encoded = encoder.fit_transform([[row[0]] for row in raw_data])
@@ -117,22 +107,17 @@ y = [row[6] for row in raw_data]
 X = np.hstack((types_encoded, numeric))
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SAMPLES / (TRAIN_SAMPLES + TEST_SAMPLES), random_state=42)
-
-# workloads: one step per sample
 workload_train = generate_bursty_workload(NUM_NODES, steps=len(X_train), base_rate=30, burst_prob=0.25, skew_strength=0.7)
 workload_test  = generate_bursty_workload(NUM_NODES, steps=len(X_test), base_rate=30, burst_prob=0.25, skew_strength=0.7)
 
-print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+print(f"Train: {len(X_train)}, Test: {len(X_test)}")
 
-# -------------------- STEP 2: Self-Supervised Context Encoder --------------------
-
+# -------------------- SELF-SUPERVISED MODEL --------------------
 class ContextDataset(Dataset):
     def __init__(self, X):
         self.X = X.astype(np.float32)
-
     def __len__(self):
         return len(self.X)
-
     def __getitem__(self, idx):
         x = self.X[idx].copy()
         mask = np.random.randint(0, len(x))
@@ -150,7 +135,6 @@ class ContextEncoder(nn.Module):
             nn.ReLU()
         )
         self.predictor = nn.Linear(hidden_dim, 1)
-
     def forward(self, x):
         h = self.encoder(x)
         return self.predictor(h)
@@ -160,44 +144,40 @@ train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = ContextEncoder(input_dim=X_train.shape[1]).to(device)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-criterion = nn.MSELoss()
+opt = optim.Adam(model.parameters(), lr=1e-3)
+crit = nn.MSELoss()
 
-print("Pretraining context encoder (brief)...")
-for epoch in range(3):  # keep short for real runs
-    total_loss = 0.0
+print("Pretraining encoder (brief)...")
+for epoch in range(2):
+    tot = 0.0
     model.train()
-    for batch_x, batch_y in train_loader:
-        batch_x = batch_x.to(device)
-        batch_y = batch_y.to(device)
-        optimizer.zero_grad()
-        out = model(batch_x).squeeze()
-        loss = criterion(out, batch_y)
+    for bx, by in train_loader:
+        bx = bx.to(device); by = by.to(device)
+        opt.zero_grad()
+        out = model(bx).squeeze()
+        loss = crit(out, by)
         loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    print(f"Context pretrain Epoch {epoch+1}, Loss: {total_loss:.4f}")
+        opt.step()
+        tot += loss.item()
+    print(f"Epoch {epoch+1}, Loss {tot:.4f}")
 
-# -------------------- STEP 3: Policy Head (inference-only) --------------------
-
+# -------------------- POLICY HEAD --------------------
 class PolicyHead(nn.Module):
     def __init__(self, encoder, hidden_dim=64, num_nodes=NUM_NODES):
         super().__init__()
-        self.encoder = encoder.encoder  # reuse encoder part only
+        self.encoder = encoder.encoder
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, num_nodes)
         )
-
     def forward(self, x):
         h = self.encoder(x)
         return self.head(h)
 
-scheduler = PolicyHead(model, num_nodes=NUM_NODES).to(device)
+scheduler = PolicyHead(model).to(device)
 
-# -------------------- DOCKER-BASED INVOCATION UTILITIES --------------------
-
+# -------------------- DOCKER UTILS & INVOCATION (instrumented) --------------------
 def safe_container_remove(container):
     try:
         container.stop(timeout=1)
@@ -208,10 +188,9 @@ def safe_container_remove(container):
     except Exception:
         pass
 
-def wait_for_http(container_name, port=FUNCTION_PORT, timeout=8.0, interval=0.25):
-    """Wait until container HTTP endpoint is responding (within same docker network by name)."""
-    deadline = time.time() + timeout
+def wait_for_http(container_name, port=FUNCTION_PORT, timeout=6.0, interval=0.25):
     url = f"http://{container_name}:{port}/invoke"
+    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             r = requests.post(url, timeout=1)
@@ -222,95 +201,93 @@ def wait_for_http(container_name, port=FUNCTION_PORT, timeout=8.0, interval=0.25
         time.sleep(interval)
     return False
 
-def ensure_container_for_function(node, func_type_idx, key_by='func_type'):
-    """
-    Ensure a warm container exists on given node for func_type_idx.
-    Keying currently uses func_type only (keeps warm containers small).
-    Returns (container_name, cold_flag)
-    """
+def ensure_container_for_function(node, func_type_idx):
     pool = warm_pool[node]
-    key = int(func_type_idx)  # if key_by == 'func_id', use tuple (func_type_idx,user)
+    key = int(func_type_idx)
     if key in pool:
-        # Move used key to end to implement LRU-ish behavior
         pool.move_to_end(key)
-        return pool[key]["name"], 0
-
-    # Cold start: start a new container with deterministic name within network
+        return pool[key]["name"], 0, 0.0  # name, cold_flag, startup_time_ms=0
     safe_suffix = uuid4().hex[:6]
     container_name = f"node{node}-f{func_type_idx}-{safe_suffix}"
-
     image = FUNCTION_IMAGES[func_type_idx]
     try:
-        container = client.containers.run(
-            image,
-            name=container_name,
-            detach=True,
-            network=DOCKER_NETWORK,
-            # inside network we can reach container by name:port
-            # avoid mapping host ports here to keep network-local addressing clean
-        )
-    except docker.errors.APIError as e:
-        # If name conflict or other issue: try a random name
+        container = client.containers.run(image, name=container_name, detach=True, network=DOCKER_NETWORK)
+    except docker.errors.APIError:
+        # fallback: random name
         container = client.containers.run(image, detach=True, network=DOCKER_NETWORK)
-
-    # Wait until endpoint is ready (or timeout)
+        container_name = container.name
+    t0 = time.monotonic()
     ready = wait_for_http(container_name, port=FUNCTION_PORT, timeout=6.0)
+    t1 = time.monotonic()
+    startup_time_ms = (t1 - t0) * 1000.0
     if not ready:
-        # still accept it but warn
-        print(f"[WARN] container {container_name} might not be healthy/ready.")
-
+        print(f"[WARN] container {container_name} may not be ready (wait timed out).")
     pool[key] = {"name": container_name, "container": container, "started_at": time.time()}
-    # eviction if needed (LRU)
     while len(pool) > WARM_POOL_LIMIT:
-        old_key, old_val = pool.popitem(last=False)  # pop oldest
+        old_key, old_val = pool.popitem(last=False)
         try:
             safe_container_remove(old_val["container"])
         except Exception:
             pass
-
-    return container_name, 1
+    # log creation
+    print(f"[COLD START] node={node} func={func_type_idx} container={container_name} startup_ms={startup_time_ms:.1f}")
+    return container_name, 1, startup_time_ms
 
 def invoke_function_docker(node, func_type_idx, extra_load=0.0):
     """
-    Ensure container and invoke /invoke endpoint. Returns (latency_ms, reward, cold_flag).
+    Returns: total_latency_ms, startup_time_ms, invoke_time_ms, cold_flag
     """
-    container_name, cold = ensure_container_for_function(node, func_type_idx)
+    t_before = time.monotonic()
+    container_name, cold_flag, startup_ms = ensure_container_for_function(node, func_type_idx)
+    t_after_ensure = time.monotonic()
+    # If warm, startup_ms should be 0 (ensured above)
     url = f"http://{container_name}:{FUNCTION_PORT}/invoke"
     t0 = time.monotonic()
     try:
         r = requests.post(url, timeout=15)
         r.raise_for_status()
     except Exception as e:
-        # if request fails, give very large penalty and attempt cleanup of container
-        print(f"[ERROR] Invocation failed for {container_name}: {e}")
-        # try to remove the container to avoid stuck containers
+        # try to cleanup container and give big penalty
+        print(f"[ERROR] invocation failed for {container_name}: {e}")
         try:
             cont = client.containers.get(container_name)
             safe_container_remove(cont)
         except Exception:
             pass
-        # big penalty
-        latency_ms = 5000.0 + extra_load * 0.1
-        reward = -latency_ms - (100.0 if cold else 0.0)
-        return latency_ms, reward, cold
+        invoke_ms = 5000.0
+    else:
+        t1 = time.monotonic()
+        invoke_ms = (t1 - t0) * 1000.0
+    # total latency = startup + invoke + extra load penalty (we keep startup separate)
+    total_latency = startup_ms + invoke_ms + extra_load * LOAD_PENALTY
+    # do NOT add extra +100 if startup_ms already covers cold start; previously you used a static +100 — now we measure startup explicitly
+    reward = -total_latency
+    return total_latency, startup_ms, invoke_ms, cold_flag
 
-    t1 = time.monotonic()
-    latency_ms = (t1 - t0) * 1000.0
-    # optionally add synthetic extra load penalty
-    latency_ms += extra_load * LOAD_PENALTY
+# -------------------- RESET & CLEANUP --------------------
+def reset_warm_pool():
+    print("[ACTION] Resetting warm pool (stopping and removing existing warm containers)...")
+    for node_idx in range(NUM_NODES):
+        pool = warm_pool[node_idx]
+        for k, v in list(pool.items()):
+            try:
+                cont = client.containers.get(v["name"])
+                safe_container_remove(cont)
+            except Exception:
+                pass
+        pool.clear()
 
-    # cold penalty (we still count cold separately)
-    if cold:
-        latency_ms += 100.0
+def cleanup_all_warm_containers():
+    print("Final cleanup of warm pool containers...")
+    reset_warm_pool()
 
-    reward = -latency_ms
-    return latency_ms, reward, cold
-
-# -------------------- STEP 4: Evaluation / CASSIA Inference (real containers) --------------------
-
+# -------------------- EVALUATION & BASELINES --------------------
 def run_cassia_inference_on_test(scheduler_model, X_test_local, workload_pattern):
-    cold_start_events = [0] * NUM_NODES
+    # instrumentation arrays
     response_times = [[] for _ in range(NUM_NODES)]
+    startup_times = [[] for _ in range(NUM_NODES)]
+    invoke_times = [[] for _ in range(NUM_NODES)]
+    cold_start_events = [0] * NUM_NODES
     total_requests = [0] * NUM_NODES
 
     scheduler_model.eval()
@@ -319,7 +296,6 @@ def run_cassia_inference_on_test(scheduler_model, X_test_local, workload_pattern
             x_np = X_test_local[i].astype(np.float32)
             x = torch.tensor(x_np, dtype=torch.float32).to(device)
             func_type = int(np.argmax(x_np[:4]))
-            # derive a simple func_id (func_type, user)
             user_id = int(scaler.inverse_transform([x_np[4:]])[0][0])
             func_id = (func_type, user_id)
 
@@ -327,19 +303,19 @@ def run_cassia_inference_on_test(scheduler_model, X_test_local, workload_pattern
             probs = F.softmax(scores.cpu(), dim=-1).squeeze()
             node = int(torch.multinomial(probs, num_samples=1).item())
 
-            current_load = workload_pattern[i][node]
-            latency, _, cold = invoke_function_docker(node, func_type, extra_load=current_load)
+            extra_load = workload_pattern[i][node] if i < len(workload_pattern) else 0
+            total_latency, startup_ms, invoke_ms, cold = invoke_function_docker(node, func_type, extra_load=extra_load)
             if cold:
                 cold_start_events[node] += 1
-            response_times[node].append(latency)
+            response_times[node].append(total_latency)
+            startup_times[node].append(startup_ms)
+            invoke_times[node].append(invoke_ms)
             total_requests[node] += 1
 
-            # safety small sleep to avoid Docker overload
-            time.sleep(0.01)
+            # throttle to avoid overloading host
+            time.sleep(0.005)
 
-    return response_times, cold_start_events, total_requests
-
-# -------------------- STEP 5: Baselines (FIFO & Round-Robin) --------------------
+    return response_times, startup_times, invoke_times, cold_start_events, total_requests
 
 def run_baseline(strategy="fifo", workload_pattern=None):
     num_nodes_local = NUM_NODES
@@ -376,10 +352,9 @@ def run_baseline(strategy="fifo", workload_pattern=None):
     total_cold = sum(baseline_cold)
     total_time = len(X_test) * 0.1
     throughput_per_node = [reqs / total_time for reqs in baseline_requests]
-    return baseline_latency, baseline_cold, avg_latency, total_cold, throughput_per_node
+    return baseline_latency, baseline_cold, avg_latency, total_cold, throughput_per_node, baseline_requests
 
-# -------------------- STEP 6: REINFORCE TRAINING (fine-tune on real containers) --------------------
-
+# -------------------- REINFORCE (brief) --------------------
 class ReinforceScheduler(nn.Module):
     def __init__(self, encoder, hidden_dim=64, num_nodes=NUM_NODES):
         super().__init__()
@@ -389,7 +364,6 @@ class ReinforceScheduler(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, num_nodes)
         )
-
     def forward(self, x):
         h = self.encoder(x)
         logits = self.policy(h)
@@ -402,9 +376,7 @@ reinforce_optimizer = optim.Adam(reinforce_model.parameters(), lr=1e-3)
 def train_reinforce_real(model, X_data, epochs=REINFORCE_EPOCHS):
     lambda_balance = 0.05
     entropy_coef = 0.02
-
     for epoch in range(epochs):
-        # Reset or keep warm pool between epochs as design choice. We'll keep across epoch to simulate warm carry-over.
         node_counts = [0] * NUM_NODES
         log_probs, rewards, entropies = [], [], []
 
@@ -424,20 +396,17 @@ def train_reinforce_real(model, X_data, epochs=REINFORCE_EPOCHS):
             node = int(action.item())
             node_counts[node] += 1
 
-            # Real invocation — this is the slow part
             extra_load = workload_train[i][node] if i < len(workload_train) else 0
-            latency, reward, cold = invoke_function_docker(node, func_type, extra_load=extra_load)
-            # amplify reward differences
-            reward *= 1.0
+            total_latency, startup_ms, invoke_ms, cold = invoke_function_docker(node, func_type, extra_load=extra_load)
+            # reward is negative latency; amplify lightly
+            reward = -total_latency * 1.0
 
             log_probs.append(log_prob)
             rewards.append(torch.tensor(reward, dtype=torch.float32).to(device))
             entropies.append(entropy)
 
-            # small throttle
-            time.sleep(0.01)
+            time.sleep(0.005)
 
-        # Normalize rewards
         rewards = torch.stack(rewards).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
@@ -446,20 +415,17 @@ def train_reinforce_real(model, X_data, epochs=REINFORCE_EPOCHS):
             usage_dist /= usage_dist.sum()
         load_variance = torch.var(usage_dist)
 
-        # REINFORCE loss
         loss = 0.0
-        for log_p, r, ent in zip(log_probs, rewards, entropies):
-            loss = loss + (-log_p * r - entropy_coef * ent)
-
+        for lp, r, ent in zip(log_probs, rewards, entropies):
+            loss = loss + (-lp * r - entropy_coef * ent)
         loss = loss + lambda_balance * load_variance
 
         reinforce_optimizer.zero_grad()
         loss.backward()
         reinforce_optimizer.step()
-        print(f"[REINFORCE] Epoch {epoch+1} Loss: {loss.item():.2f} LoadVar: {load_variance.item():.4f} NodeCounts: {node_counts}")
+        print(f"[REINFORCE] Epoch {epoch+1} Loss {loss.item():.2f} LoadVar {load_variance.item():.4f} NodeCounts {node_counts}")
 
-# -------------------- STEP 7: Run everything end-to-end --------------------
-
+# -------------------- RUN & REPORT --------------------
 def save_bar_plot(labels, values, title, ylabel, fname):
     plt.figure(figsize=(8, 4))
     plt.bar(labels, values)
@@ -470,69 +436,73 @@ def save_bar_plot(labels, values, title, ylabel, fname):
     plt.savefig(fname)
     plt.close()
 
-def cleanup_all_warm_containers():
-    print("Cleaning up warm pool containers...")
-    for node_pool in warm_pool:
-        for k, v in list(node_pool.items()):
-            try:
-                cont = client.containers.get(v["name"])
-                safe_container_remove(cont)
-            except Exception:
-                pass
-        node_pool.clear()
+def print_node_stats(prefix, response_times, startup_times, invoke_times, cold_events, total_requests):
+    print(f"\n--- {prefix} Node-wise breakdown ---")
+    for i in range(NUM_NODES):
+        avg_lat = np.mean(response_times[i]) if response_times[i] else 0
+        avg_start = np.mean(startup_times[i]) if startup_times[i] else 0
+        avg_invoke = np.mean(invoke_times[i]) if invoke_times[i] else 0
+        containers_kept = len(warm_pool[i])
+        print(f"Node {i}: reqs={total_requests[i]}, containers_kept={containers_kept}, avg_total_lat={avg_lat:.2f} ms, avg_startup={avg_start:.2f} ms, avg_invoke={avg_invoke:.2f} ms, cold_starts={cold_events[i]}")
 
 def main():
+    global scaler  # required in several places
     try:
-        # Inference with initial (untrained) scheduler
-        print("Running CASSIA inference (initial policy)...")
-        responses, cold_events, totals = run_cassia_inference_on_test(scheduler, X_test, workload_test)
+        # Evaluate FIFO baseline
+        reset_warm_pool()
+        fifo_latency, fifo_cold, fifo_avg, fifo_total, fifo_throughput, fifo_reqs = run_baseline("fifo", workload_pattern=workload_test)
+        # For baselines we have simulated latencies but no startup/invocation separation
+        fake_startup_times = [[] for _ in range(NUM_NODES)]
+        fake_invoke_times = fifo_latency  # approximate for printing
+        print("\nFIFO baseline (simulated):")
+        print_node_stats("FIFO (sim)", fifo_latency, fake_startup_times, fake_invoke_times, fifo_cold, fifo_reqs)
 
-        # Baselines
-        fifo_latency, fifo_cold, fifo_avg, fifo_total, fifo_throughput = run_baseline("fifo", workload_pattern=workload_test)
-        rr_latency, rr_cold, rr_avg, rr_total, rr_throughput = run_baseline("round_robin", workload_pattern=workload_test)
+        # Evaluate Round Robin
+        reset_warm_pool()
+        rr_latency, rr_cold, rr_avg, rr_total, rr_throughput, rr_reqs = run_baseline("round_robin", workload_pattern=workload_test)
+        print("\nRound Robin baseline (simulated):")
+        print_node_stats("RR (sim)", rr_latency, fake_startup_times, rr_latency, rr_cold, rr_reqs)
 
-        cassia_all = [lat for lst in responses for lat in lst]
+        # CASSIA (initial policy)
+        reset_warm_pool()
+        print("\nRunning CASSIA (initial policy) on real containers...")
+        cassia_resp, cassia_start, cassia_invoke, cassia_cold, cassia_reqs = run_cassia_inference_on_test(scheduler, X_test, workload_test)
+        cassia_all = [lat for lst in cassia_resp for lat in lst]
         cassia_avg = np.mean(cassia_all) if cassia_all else 0
-        cassia_total_cold = sum(cold_events)
-
-        print("\nInitial Results:")
-        print(f"FIFO avg: {fifo_avg:.2f} ms, RR avg: {rr_avg:.2f} ms, CASSIA avg: {cassia_avg:.2f} ms")
-        print(f"Cold starts FIFO: {fifo_total}, RR: {rr_total}, CASSIA: {cassia_total_cold}")
+        print_node_stats("CASSIA (initial)", cassia_resp, cassia_start, cassia_invoke, cassia_cold, cassia_reqs)
+        print(f"CASSIA initial overall avg latency: {cassia_avg:.2f} ms, total cold starts: {sum(cassia_cold)}")
 
         # Save initial plots
-        labels = ['FIFO', 'RoundRobin', 'CASSIA']
-        avg_latencies = [fifo_avg, rr_avg, cassia_avg]
-        total_cold_starts = [fifo_total, rr_total, cassia_total_cold]
         os.makedirs("outputs", exist_ok=True)
-        save_bar_plot(labels, avg_latencies, "Average Latency per Strategy (initial)", "Latency (ms)", "outputs/avg_latency_initial.png")
-        save_bar_plot(labels, total_cold_starts, "Total Cold Starts per Strategy (initial)", "Cold Starts", "outputs/cold_starts_initial.png")
-        print("Saved initial plots to outputs/")
+        save_bar_plot(['FIFO', 'RoundRobin', 'CASSIA'], [fifo_avg, rr_avg, cassia_avg],
+                      "Average Latency per Strategy (initial)", "Latency (ms)", "outputs/avg_latency_initial.png")
+        save_bar_plot(['FIFO', 'RoundRobin', 'CASSIA'], [sum(fifo_cold), sum(rr_cold), sum(cassia_cold)],
+                      "Total Cold Starts per Strategy (initial)", "Cold Starts", "outputs/cold_starts_initial.png")
 
-        # Fine-tune with REINFORCE on real containers (small epochs!)
-        print("\nStarting REINFORCE fine-tuning on real containers (this will spawn containers)...")
+        # Fine-tune with REINFORCE
+        print("\nStarting REINFORCE fine-tuning (on real containers)...")
         train_reinforce_real(reinforce_model, X_train)
 
-        # Evaluate REINFORCE
-        print("Evaluating REINFORCE policy on test set...")
-        reinforce_responses, reinforce_colds, reinforce_totals = run_cassia_inference_on_test(reinforce_model, X_test, workload_test)
-        reinforce_all = [lat for lst in reinforce_responses for lat in lst]
+        # Evaluate REINFORCE policy
+        reset_warm_pool()
+        print("\nEvaluating REINFORCE policy on test set (real containers)...")
+        reinforce_resp, reinforce_start, reinforce_invoke, reinforce_cold, reinforce_reqs = run_cassia_inference_on_test(reinforce_model, X_test, workload_test)
+        reinforce_all = [lat for lst in reinforce_resp for lat in lst]
         reinforce_avg = np.mean(reinforce_all) if reinforce_all else 0
-        reinforce_total_cold = sum(reinforce_colds)
+        print_node_stats("REINFORCE", reinforce_resp, reinforce_start, reinforce_invoke, reinforce_cold, reinforce_reqs)
+        print(f"REINFORCE overall avg latency: {reinforce_avg:.2f} ms, total cold starts: {sum(reinforce_cold)}")
 
-        print("\nREINFORCE Results:")
-        print(f"REINFORCE avg latency: {reinforce_avg:.2f} ms, total cold starts: {reinforce_total_cold}")
-
+        # Save final plots
         labels = ['FIFO', 'RoundRobin', 'CASSIA (initial)', 'REINFORCE']
         avg_latencies = [fifo_avg, rr_avg, cassia_avg, reinforce_avg]
-        total_cold_starts = [fifo_total, rr_total, cassia_total_cold, reinforce_total_cold]
+        total_cold_starts = [sum(fifo_cold), sum(rr_cold), sum(cassia_cold), sum(reinforce_cold)]
         save_bar_plot(labels, avg_latencies, "Average Latency per Strategy (final)", "Latency (ms)", "outputs/avg_latency_final.png")
         save_bar_plot(labels, total_cold_starts, "Total Cold Starts per Strategy (final)", "Cold Starts", "outputs/cold_starts_final.png")
-        print("Saved final plots to outputs/")
+        print("Plots saved to outputs/")
 
     finally:
-        # attempt cleanup to avoid leftover containers
         cleanup_all_warm_containers()
-        print("Done. Check outputs/ for graphs.")
+        print("Done. Cleaned up containers.")
 
 if __name__ == "__main__":
     main()
