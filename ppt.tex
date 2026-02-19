@@ -1,0 +1,424 @@
+\documentclass{beamer}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[backend=biber,style=ieee]{biblatex} % Use biblatex with ieee style
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{positioning, shapes.geometric, arrows.meta}
+\usepackage{algorithm} % For algorithm environment
+\usepackage{algpseudocode} % For algorithmic environment
+
+% Fix for algorithm numbers in Beamer
+\setbeamertemplate{caption}[numbered] % Ensure algorithm captions are numbered
+
+\tikzset{
+  block/.style={
+    rectangle, draw=blue!60, fill=blue!10, rounded corners,
+    text width=5.2cm, minimum height=1.2cm, align=left, font=\scriptsize
+  },
+  arrow/.style={thick, ->, >=Stealth}
+}
+\addbibresource{references.bib} % Reference to the .bib file
+
+\title{CASSIA: Towards Unified, Autonomous Scheduling for Highly Variable Serverless Workloads}
+\author{Pranav Digamber Talegaonkar}
+\institute{Guided by: Dr. T Veni}
+\date{}
+
+% Define footer bar color
+\definecolor{footerblue}{RGB}{0,70,140} % Dark blue
+\setbeamercolor{footlinecolor}{bg=footerblue,fg=white}
+
+\setbeamertemplate{footline}{
+  \leavevmode%
+  \begin{beamercolorbox}[wd=\paperwidth,ht=3ex,dp=1.2ex,leftskip=1em,rightskip=1em]{footlinecolor}
+    \usebeamerfont{author in head/foot}%
+    \textbf{Pranav Digamber Talegaonkar} \hfill NIT Calicut \hfill \insertframenumber/\inserttotalframenumber
+  \end{beamercolorbox}%
+}
+
+
+\begin{document}
+
+\begin{frame}
+    \titlepage
+\end{frame}
+
+\begin{frame}{Introduction}
+    \begin{center}
+        \includegraphics[width=0.8\textwidth]{intro_image1.png}
+        \\
+        % \includegraphics[width=0.8\textwidth]{intro_image2.png}
+        \end{center}
+    \begin{itemize}
+        \item Serverless computing eliminates infrastructure management, enabling automatic scaling and cost-efficiency.
+        \item Challenges include cold starts, resource contention, and inefficient scheduling.
+        % \item Various techniques improve scheduling and resource allocation.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Motivation}
+    \begin{itemize}
+        \item Serverless computing faces performance degradation due to workload variability.
+        \item Efficient scheduling is essential to optimize resource allocation and reduce costs.
+        \item This review explores recent advancements to address these challenges.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Problem Definition}
+    % \begin{itemize}
+    %     \item Optimizing serverless task scheduling while balancing cost, latency, and scalability.
+    %     \item Managing dependencies and resource allocation dynamically in highly variable workloads.
+    %     \item Reducing inefficiencies like cold starts and resource contention to improve overall system performance.
+    %     \item Current static scheduling strategies often fail to adapt to dynamic serverless environments.
+    % \end{itemize}
+    Design a hybrid scheduler using a self-supervised context encoder and REINFORCE policy to assign function invocations to nodes while minimizing latency and cold starts.
+\end{frame}
+
+\begin{frame}{Literature Review - ENSURE(Efficient scheduling and autonomous resource management in serverless environments)}
+    \begin{itemize}
+        \item Classifies functions into Edge-Triggered(short-lived) and Massively Parallel(long-running).
+        \item Regulates resource usage to prevent contention.
+        \item Uses greedy packing to optimize invoker utilization.
+        \item Results: 52\% resource efficiency improvement, 60\% cold start reduction.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Literature Review - SSC (Sustainable Serverless Computing)}
+    \begin{center}
+        \includegraphics[width=0.6\textwidth, height=0.4\textheight, keepaspectratio]{ssc_image1.png}
+        \vspace{0.3cm} % Adjust vertical spacing if needed
+    \end{center}
+    \begin{itemize}
+        \item Gradient-based pre-warming optimization reduces cold start hit rate based on invocation rate.
+        \item Critical path selection optimizes the most impactful function execution.
+        \item Results: 50\% cold start reduction, 30\% cost savings.
+    \end{itemize}
+\end{frame}
+
+
+\begin{frame}{Literature Review - Synergy}
+    \begin{center}
+        \includegraphics[width=0.8\textwidth]{synergy_image1.png}
+        \\
+        % \includegraphics[width=0.8\textwidth]{intro_image2.png}
+        \end{center}
+    \begin{itemize}
+        \item Hybrid scheduling with central and local schedulers for improved coordination.
+        \item Central scheduler for global resource view; local schedulers for immediate decisions.
+        \item Results: 63\% average execution time reduction, 30\% faster task completion.
+    \end{itemize}
+\end{frame}
+
+
+\begin{frame}{Proposed Solution: CASSIA}
+    The \textbf{CASSIA} (Context-Aware Self-Supervised Intelligent Autoscheduler) framework uses a three-step learning process:
+    \begin{itemize}
+        \item \textbf{Phase 1: Pre-train} (Offline Self-Supervised Learning)
+        \begin{itemize}
+            \item Learns robust "smart profiles" (embeddings) of functions from unlabeled data.
+            \item Identifies inherent function characteristics and relationships.
+        \end{itemize}
+        \item \textbf{Phase 2: Schedule} (Real-time Adaptive Decision-Making)
+        \begin{itemize}
+            \item Uses pre-trained profiles to make fast, intelligent scheduling decisions for new invocations.
+            \item Optimizes for latency and cold start avoidance.
+        \end{itemize}
+        \item \textbf{Phase 3: Fine-Tune} (Online Reinforcement Learning)
+        \begin{itemize}
+            \item Continuously improves the scheduling policy based on real-world feedback (latency, cold starts).
+            \item Adapts to changing workload patterns and environment conditions.
+        \end{itemize}
+    \end{itemize}
+\end{frame}
+
+
+\begin{frame}[fragile]{CASSIA Phase 1: Pre-train (Offline Profiling)}
+    % \textbf{Goal:} Generate robust "smart profiles" or embeddings ($\mathbf{h}$) for functions using unlabeled data, capturing execution patterns and resource needs.
+
+    % \begin{minipage}{0.95\textwidth}
+    % \begin{algorithmic}[1]
+    %     \Function{Pre-train}{$\mathcal{D}_{\text{unlabeled}}$} \Comment{Self-Supervised Context Encoding}
+    %         \ForAll{Invocation $\mathbf{x} \in \mathcal{D}_{\text{unlabeled}}$}
+    %             \State Randomly hide feature $x_m \rightarrow \mathbf{x}'$
+    %             \State $\mathbf{h} \leftarrow \mathcal{E}(\mathbf{x}')$ \Comment{Generate smart function profile (embedding)}
+    %             \State $\hat{x}_m \leftarrow \mathcal{P}(\mathbf{h})$ \Comment{Guess the hidden feature}
+    %             \State Adjust $\mathcal{E}$ and $\mathcal{P}$ to minimize the guess error
+    %         \EndFor
+    %     \EndFunction
+    % \end{algorithmic}
+    % \end{minipage}
+
+    \vspace{0.5cm}
+    \begin{itemize}
+        \item \textbf{Self-Supervised Learning:} The model learns by masking a feature ($x_m$) and trying to predict it ($\hat{x}_m$).
+        \item \textbf{Result:} Creates a compact and context-aware vector ($\mathbf{h}$) that intelligently represents the function's characteristics.
+        \item \textbf{Benefit:} Faster and more accurate scheduling decisions in the next phase.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{CASSIA Phase 2: Schedule (Adaptive Live Decision)}
+    
+
+    % \begin{minipage}{0.95\textwidth}
+    % \begin{algorithmic}[1]
+    %     \Function{Schedule}{$\mathbf{x}_{\text{new}}$} \Comment{Adaptive Scheduling (Live Decision)}
+    %         \State $\mathbf{h} \leftarrow \mathcal{E}(\mathbf{x}_{\text{new}})$ \Comment{Input: smart profile}
+    %         \State $\mathbf{p} \leftarrow \pi(\mathbf{h})$ \Comment{Get node selection probabilities}
+    %         \State $n^* \leftarrow \text{argmax}(\mathbf{p})$ \Comment{Pick the most likely best node}
+    %         \State $\text{func\_id} \leftarrow \text{ExtractID}(\mathbf{x}_{\text{new}})$
+    %         \State \textbf{if} $\text{func\_id} \in W_{n^*}$ \textbf{then} Cold Start $C=0$
+    %         \State \textbf{else} Cold Start $C=1$
+    %         \State Execute Function on $n^*$. Record Latency $\mathcal{L}$.
+    %         \State $W_{n^*} \leftarrow W_{n^*} \cup \{\text{func\_id}\}$ \Comment{Update Warm Pool status}
+    %         \State \textbf{return} $n^*$
+    %     \EndFunction
+    % \end{algorithmic}
+    % \end{minipage}
+
+    \vspace{0.5cm}
+    \begin{itemize}
+        \item \textbf{Inference:} The pre-trained encoder $\mathcal{E}$ generates the function profile ($\mathbf{h}$).
+        \item \textbf{Decision:} The Policy Head $\pi$ uses $\mathbf{h}$ to calculate the best node ($n^*$), prioritizing warm containers ($\text{func\_id} \in W_{n^*}$) to avoid cold starts ($C=1$).
+        \item \textbf{Output:} The function is executed, and its actual performance ($\mathcal{L}$) is recorded for the next phase.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{CASSIA Phase 3: Fine-Tune (Online Reinforcement Learning)}
+    \textbf{Goal:} Continuously adjust the Policy Head ($\pi$) using real-time feedback (latency and cold starts) to maximize the overall system reward.
+
+    \begin{minipage}{0.95\textwidth}
+    \begin{algorithmic}[1]
+        % \Function{Fine-Tune}{$\mathcal{D}_{\text{online}}$} \Comment{Reinforcement Learning (Continuous Improvement)}
+        %     \ForAll{Invocation $\mathbf{x} \in \mathcal{D}_{\text{online}}$}
+        %         \State $\mathbf{h} \leftarrow \mathcal{E}(\mathbf{x})$
+        %         \State Sample action $n$ from $\pi(\mathbf{h})$
+        %         \State Measure Latency $\mathcal{L}$ and Cold Start $C$.
+                % \State Compute Reward $R \leftarrow -\mathcal{L} - \text{Penalty} \cdot C - \text{Load\_Var\_Penalty}$
+        %         \State Adjust $\pi$ to maximize $R$
+        %     \EndFor
+        % \EndFunction
+    \end{algorithmic}
+    \end{minipage}
+
+    \vspace{0.5cm}
+    \begin{itemize}
+        \item \textbf{Reward Function ($R$):} Designed to penalize high latency ($\mathcal{L}$), cold starts ($C$), and load imbalance, encouraging efficient scheduling.
+        \item \textbf{RL Update:} The policy ($\pi$) is updated based on the calculated reward $R$ (e.g., using PPO), ensuring CASSIA adapts automatically to changing workloads.
+        \item \textbf{Adaptation:} The system learns from its own execution history to become increasingly intelligent.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{PARL in CASSIA + REINFORCE}
+\centering
+\begin{footnotesize}
+\begin{tabular}{|c|p{3.4cm}|p{4.6cm}|}
+\hline
+\textbf{Stage} & \textbf{RL Meaning} & \textbf{Scheduler Details} \\
+\hline
+Perception
+ & Observed state  
+ & invocation features + live node load (active requests) + implicit warm pool latency feedback\\
+\hline
+Action
+ & Executed decision  
+ & pick a node, start/reuse a container, and invoke function.\\
+\hline
+Reasoning
+ & Policy computation  
+ & Encoder (pretrained) → Policy net → Load-aware adjustment → Node decision
+\\
+\hline
+Learning
+ & Policy update  
+ & Reward $r=-$(lat+load-pen)\\
+\hline
+\end{tabular}
+\end{footnotesize}
+\end{frame}
+
+
+
+
+% \begin{frame}{CASSIA Deployment: Safety and Reliability}
+%     \begin{itemize}
+%         \item \textbf{Fallback Plan:} A simple backup scheduler (e.g., Round Robin) is always ready if CASSIA encounters issues.
+%         \item \textbf{Testing Safely (Shadow Mode):}
+%         \begin{itemize}
+%             \item CASSIA makes scheduling decisions, but the *existing* scheduler still executes the job.
+%             \item Allows performance comparison against reality before full deployment, minimizing risk.
+%         \end{itemize}
+%     \end{itemize}
+% \end{frame}
+
+% \begin{frame}{Workload Simulation Details}
+% \begin{itemize}
+%     \item Each request has:
+%     \begin{itemize}
+%         \item Random latency between \texttt{50--150 ms}.
+%         \item Cold start events triggered probabilistically.
+%         \item Resource usage (CPU \%, Memory MB).
+%     \end{itemize}
+%     \item Simulates both \textbf{warm} and \textbf{cold} starts.
+%     \item Captures skewed, bursty, and balanced workload patterns.
+% \end{itemize}
+% \end{frame}
+
+% \begin{frame}[fragile]{Function Invocation Simulation}
+% \begin{itemize}
+%     \item Simulates 10,000 function calls with:
+%     \begin{itemize}
+%         \item Types: login, upload, analytics, batch
+%         \item User IDs, arrival times, payload sizes
+%         \item CPU, memory usage, cold start labels
+%     \end{itemize}
+%     \item Data used as input features for training/testing.
+% \end{itemize}
+% \end{frame}
+
+% \begin{frame}[fragile]{Simulation Loop with CASSIA Inference}
+% \begin{itemize}
+%     \item For each test sample:
+%     \begin{itemize}
+%         \item Compute node scores and probabilities.
+%         \item Sample a node to schedule function.
+%         \item Check warm pool to decide cold start.
+%         \item Simulate latency based on load and cold start penalty.
+%         \item Track cold starts, latencies, throughput.
+%     \end{itemize}
+%     \item Warm pool limits cached function instances per node.
+% \end{itemize}
+% \end{frame}
+\begin{frame}{System Architecture}
+\begin{center}
+\begin{columns}
+  \column{0.48\textwidth}
+    \includegraphics[width=\linewidth]{Architecture.png}
+
+  \column{0.48\textwidth}
+    \includegraphics[width=\linewidth]{Nodes.png}
+\end{columns}
+\end{center}
+\end{frame}
+
+
+\begin{frame}{Evaluation Metrics}
+\begin{itemize}
+    \item \textbf{Average Latency:} Mean response time for function invocations across all nodes.
+    \item \textbf{Cold Starts:} Total count of cold start events, indicating efficiency in reusing warm containers.
+    \item \textbf{Baseline Comparison:} Performance evaluated against traditional \textbf{FIFO Scheduler} and \textbf{Round Robin} strategies.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Total Cold Starts per Strategy}
+
+\begin{columns}[T]
+  \column{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{total_cold_starts.png}
+    \\ \small (a) Simulation / synthetic
+
+  \column{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{cold_starts_final_real.png}
+    \\ \small (b) Real containers
+\end{columns}
+
+\end{frame}
+
+
+\begin{frame}{Average Latency per Strategy}
+  \begin{columns}[T]
+    \column{0.48\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{avg_latency.png}
+      \\ \small (a) Simulation / synthetic
+    \column{0.48\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{avg_latency_final_real.png}
+      \\ \small (b) Real containers
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Evaluation Summary}
+\footnotesize
+\begin{tabular}{|l |c |c|c |c |c|}
+\hline
+Strategy & p50(ms) & p95(ms)& latency & Cold starts & Req. served \\
+\hline
+FIFO (real) & 149.09 & 746.71& 261.42 & 20 & 160 \\
+RR (real) & 147.18 & 651.39& 252.05 & 20 & 160 \\
+CASSIA & 140.53 & 663.91& 225.21 & 10 & 160 \\
+REINFORCE & 133.12 & 751.77& 222.09 & 8 & 160 \\
+\hline
+\end{tabular}
+\end{frame}
+
+
+
+
+\begin{frame}{Conclusion}
+    % Through innovative approaches, researchers have made notable strides in tackling challenges like cold starts, resource contention, and performance variability in serverless computing.
+
+\vspace{1ex}
+Frameworks such as \textbf{ENSURE}, \textbf{SSC}, \textbf{Synergy}, and my proposed \textbf{CASSIA} have demonstrated measurable improvements in Cold Start reduction
+and Latency reduction.
+
+
+\vspace{1ex}
+
+Designed fully autonomous, adaptive, and self-optimizing schedulers that can handle workload variability.
+
+
+
+\end{frame}
+
+\begin{frame}{References}
+    \begin{thebibliography}{9}
+        
+    
+    \bibitem{}  Amoghavarsha Suresh, Gagan Somashekar, Anandh Varadarajan, Veerendra Ramesh Kakarla, Hima Upadhyay, and Anshul Gandhi. Ensure: Efficient scheduling and autonomous resource management in serverless environments. Proceedings of the ACM Symposium on Cloud Computing, 2020.
+    \bibitem{} Shanxing Pan, Hongyu Zhao, Zinuo Cai, Dongmei Li, Ruhui Ma, and Haibing Guan. Sustainable serverless computing with cold-start optimization and automatic workflow resource scheduling.
+IEEE Transactions on Cloud Computing, 2024.
+    \bibitem{} Tanaya Biswas and Prashant Kumar. Optimizing
+resource management in serverless computing: A
+dynamic adaptive scaling approach. Proceedings
+of the IEEE International Conference on Cloud
+Computing, 2024.
+
+    
+\end{thebibliography}
+\end{frame}
+
+\begin{frame}{References}
+    \begin{thebibliography}{9}
+        
+
+    \bibitem [4] HHanmei Chen, Jianing You, Laiping Zhao, Yanan
+Yang, and Keqiu Li. Synergy: Collaborating centralized and local scheduling for serverless functions. Proceedings of the IEEE International Conference on Distributed Computing Systems, 2024.
+    \bibitem [5] MMina Morcos and Ibrahim Matta. Inverse response time ratio scheduler: Optimizing throughput and response time for serverless computing. Boston University Computer Science Research Reports, 2023.
+    \bibitem [6] BBartlomiej Przybylski, Pawel
+Zuk, and Krzysztof
+Rzadca. Data-driven scheduling in serverless
+computing to reduce response time. In 2021
+IEEE/ACM 21st International Symposium on
+Cluster, Cloud and Internet Computing (CCGrid), pages 256–266. IEEE, 2021.
+
+    
+\end{thebibliography}
+\end{frame}
+
+\begin{frame}{References}
+    \begin{thebibliography}{9}
+        \bibitem [7] HHanfei Yu, Athirai A. Irissappane, Hao Wang,
+and Wes J. Lloyd. Faasrank: Learning to schedule
+functions in serverless platforms. In Proceedings
+of the 2021 IEEE International Conference on
+Autonomic Computing and Self-Organizing Systems (ACSOS), pages 31–40. IEEE, 2021.
+
+\bibitem [8] NNima Mahmoudi and Hamzeh Khazaei. Performance modeling of serverless computing platforms. IEEE Transactions on Cloud Computing,
+10(4):2291–2305, 2022.
+    \end{thebibliography}
+\end{frame}
+
+\end{document}

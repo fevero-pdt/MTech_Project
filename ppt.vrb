@@ -1,0 +1,23 @@
+\frametitle{CASSIA Phase 3: Fine-Tune (Online Reinforcement Learning)}
+\textbf{Goal:} Continuously adjust the Policy Head ($\pi$) using real-time feedback (latency and cold starts) to maximize the overall system reward.
+
+    \begin{minipage}{0.95\textwidth}
+    \begin{algorithmic}[1]
+        % \Function{Fine-Tune}{$\mathcal{D}_{\text{online}}$} \Comment{Reinforcement Learning (Continuous Improvement)}
+        %     \ForAll{Invocation $\mathbf{x} \in \mathcal{D}_{\text{online}}$}
+        %         \State $\mathbf{h} \leftarrow \mathcal{E}(\mathbf{x})$
+        %         \State Sample action $n$ from $\pi(\mathbf{h})$
+        %         \State Measure Latency $\mathcal{L}$ and Cold Start $C$.
+                % \State Compute Reward $R \leftarrow -\mathcal{L} - \text{Penalty} \cdot C - \text{Load\_Var\_Penalty}$
+        %         \State Adjust $\pi$ to maximize $R$
+        %     \EndFor
+        % \EndFunction
+    \end{algorithmic}
+    \end{minipage}
+
+    \vspace{0.5cm}
+    \begin{itemize}
+        \item \textbf{Reward Function ($R$):} Designed to penalize high latency ($\mathcal{L}$), cold starts ($C$), and load imbalance, encouraging efficient scheduling.
+        \item \textbf{RL Update:} The policy ($\pi$) is updated based on the calculated reward $R$ (e.g., using PPO), ensuring CASSIA adapts automatically to changing workloads.
+        \item \textbf{Adaptation:} The system learns from its own execution history to become increasingly intelligent.
+    \end{itemize}

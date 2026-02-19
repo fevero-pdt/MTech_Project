@@ -47,7 +47,7 @@ WARM_POOL_LIMIT = 1000
 
 TRAIN_SAMPLES = 400
 TEST_SAMPLES = 160
-REINFORCE_EPOCHS = 2
+REINFORCE_EPOCHS = 5
 BATCH_SIZE = 64
 LOAD_PENALTY = 0.10
 
@@ -422,44 +422,6 @@ def run_cassia_inference_on_test(scheduler_model, X_test_local, workload_pattern
 
     return response_times, startup_times, invoke_times, cold_start_events, total_reqs_local
 
-# -------------------- SIMULATED BASELINE (kept for reference) --------------------
-def run_baseline_sim(strategy="fifo", workload_pattern=None):
-    num_nodes_local = NUM_NODES
-    rr_counter = 0
-    node_free_time = [0.0] * num_nodes_local
-    baseline_cold = [0] * num_nodes_local
-    baseline_latency = [[] for _ in range(num_nodes_local)]
-    baseline_requests = [0] * num_nodes_local
-    current_time = 0.0
-    if workload_pattern is None:
-        workload_pattern = [[0]*num_nodes_local for _ in range(len(X_test))]
-
-    for i in range(len(X_test)):
-        true_cold = y_test[i]
-        base_latency = random.uniform(50, 150)
-        if strategy == "fifo":
-            node = min(range(num_nodes_local), key=lambda n: node_free_time[n])
-        elif strategy == "round_robin":
-            node = rr_counter % num_nodes_local
-            rr_counter += 1
-        else:
-            node = 0
-        current_load = workload_pattern[i][node]
-        latency = base_latency + current_load * LOAD_PENALTY
-        if true_cold:
-            latency += 100
-            baseline_cold[node] += 1
-        finish_time = max(current_time, node_free_time[node]) + latency
-        node_free_time[node] = finish_time
-        baseline_latency[node].append(latency)
-        baseline_requests[node] += 1
-    all_latencies = [lat for lst in baseline_latency for lat in lst]
-    avg_latency = np.mean(all_latencies) if all_latencies else 0
-    total_cold = sum(baseline_cold)
-    total_time = len(X_test) * 0.1
-    throughput_per_node = [reqs / total_time for reqs in baseline_requests]
-    return baseline_latency, baseline_cold, avg_latency, total_cold, throughput_per_node, baseline_requests
-
 # -------------------- REINFORCE (with load-aware logits) --------------------
 class ReinforceScheduler(nn.Module):
     def __init__(self, encoder, hidden_dim=64, num_nodes=NUM_NODES):
@@ -657,8 +619,8 @@ def main():
         labels = ['FIFO(real)', 'RR(real)', 'CASSIA (initial)', 'REINFORCE']
         avg_latencies = [fifo_avg_real, rr_avg_real, cassia_avg, reinforce_avg]
         total_cold_starts = [sum(fifo_cold_counts), sum(rr_cold_counts), sum(cassia_cold), sum(reinforce_cold)]
-        save_bar_plot(labels, avg_latencies, "Average Latency per Strategy (final-real)", "Latency (ms)", "outputs/avg_latency_final_real.png")
-        save_bar_plot(labels, total_cold_starts, "Total Cold Starts per Strategy (final-real)", "Cold Starts", "outputs/cold_starts_final_real.png")
+        save_bar_plot(labels, avg_latencies, "Average Latency per Strategy", "Latency (ms)", "outputs/avg_latency_final_real.png")
+        save_bar_plot(labels, total_cold_starts, "Total Cold Starts per Strategy", "Cold Starts", "outputs/cold_starts_final_real.png")
         print("Plots saved to outputs/")
 
     finally:
