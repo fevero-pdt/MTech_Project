@@ -238,10 +238,26 @@ def ensure_container_for_function(node, func_type_idx, user_id=None):
     container_name = f"node{node}-f{func_type_idx}-p{len(pool)}-{safe_suffix}"
     image = FUNCTION_IMAGES[func_type_idx]
     try:
-        container = client.containers.run(image, name=container_name, detach=True, network=DOCKER_NETWORK)
+        container = client.containers.run(
+            image,
+            name=container_name,
+            detach=True,
+            network=DOCKER_NETWORK,
+            mem_limit="512m",          # 512 MB memory limit
+            nano_cpus=500000000,       # 0.5 CPU core
+            pids_limit=100             # process limit
+        )
     except docker.errors.APIError:
-        container = client.containers.run(image, detach=True, network=DOCKER_NETWORK)
+        container = client.containers.run(
+            image,
+            detach=True,
+            network=DOCKER_NETWORK,
+            mem_limit="512m",
+            nano_cpus=500000000,
+            pids_limit=100
+        )
         container_name = container.name
+
 
     t0 = time.monotonic()
     ready = wait_for_http(container_name, port=FUNCTION_PORT, timeout=6.0)
@@ -264,7 +280,12 @@ def invoke_function_docker(node, func_type_idx, extra_load=0.0, user_id=None):
     (Does NOT modify active_requests; caller must increment/decrement around this call.)
     """
     container_name, cold_flag, startup_ms = ensure_container_for_function(node, func_type_idx, user_id=user_id)
-    url = f"http://{container_name}:{FUNCTION_PORT}/invoke"
+    container_obj = client.containers.get(container_name)
+    container_obj.reload()
+    container_ip = container_obj.attrs["NetworkSettings"]["Networks"][DOCKER_NETWORK]["IPAddress"]
+
+    url = f"http://{container_ip}:{FUNCTION_PORT}/invoke"
+
     t0 = time.monotonic()
     try:
         r = requests.post(url, timeout=15)
@@ -280,7 +301,13 @@ def invoke_function_docker(node, func_type_idx, extra_load=0.0, user_id=None):
     else:
         t1 = time.monotonic()
         invoke_ms = (t1 - t0) * 1000.0
-    total_latency = startup_ms + invoke_ms + extra_load * LOAD_PENALTY
+    # -------------------- REAL QUEUE DELAY MODEL --------------------
+    SERVICE_TIME_ESTIMATE = 200.0  # ms (approx avg invoke time)
+
+    queue_delay_ms = max(0, active_requests[node] - 1) * SERVICE_TIME_ESTIMATE
+
+    total_latency = startup_ms + invoke_ms + queue_delay_ms + extra_load * LOAD_PENALTY
+
     return total_latency, startup_ms, invoke_ms, cold_flag
 
 # -------------------- RESET & CLEANUP --------------------
